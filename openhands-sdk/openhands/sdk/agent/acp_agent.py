@@ -23,6 +23,7 @@ import inspect
 import json
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -3037,6 +3038,14 @@ class ACPAgent(AgentBase):
             )
             prior_session_id = None
 
+        # On Windows, resolving first lets CreateProcess launch command shims
+        # such as ``.cmd`` files. Preserve the original command when it cannot
+        # be resolved so custom commands retain the subprocess API's existing
+        # error behavior (and test doubles can still intercept the launch).
+        _resolved_command = (
+            shutil.which(command, path=env.get('PATH', '')) or command
+        )
+
         async def _init() -> tuple[
             str, str, str, str | None, list[ACPModelInfo] | None, bool
         ]:
@@ -3045,7 +3054,7 @@ class ACPAgent(AgentBase):
             # ACP servers (e.g. claude-code-acp v0.1.x) write to
             # stdout.
             process = await asyncio.create_subprocess_exec(
-                command,
+                _resolved_command,
                 *args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,

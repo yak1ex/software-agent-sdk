@@ -23,6 +23,7 @@ import inspect
 import json
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -2952,6 +2953,12 @@ class ACPAgent(AgentBase):
             )
             prior_session_id = None
 
+        _resolved_command = shutil.which(command, path=env.get('PATH', ''))
+        if _resolved_command is None:
+            raise FileNotFoundError(
+                f"Cannot find ACP command {command!r} on PATH"
+            )
+
         async def _init() -> tuple[
             str, str, str, str | None, list[ACPModelInfo] | None, bool
         ]:
@@ -2960,7 +2967,7 @@ class ACPAgent(AgentBase):
             # ACP servers (e.g. claude-code-acp v0.1.x) write to
             # stdout.
             process = await asyncio.create_subprocess_exec(
-                command,
+                _resolved_command,
                 *args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,

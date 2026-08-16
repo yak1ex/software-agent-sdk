@@ -25,6 +25,7 @@ openhands-sdk = { workspace = true }
 openhands-tools = { workspace = true }
 openhands-workspace = { workspace = true }
 openhands-agent-server = { workspace = true }
+libtmux = { git = "https://github.com/yak1ex/libtmux.git", rev = "61150bca9fb1ef3e5fdbe06965af09f0ae4c4bb9" } # fork version for psmux issue
 
 [dependency-groups]
 dev = [

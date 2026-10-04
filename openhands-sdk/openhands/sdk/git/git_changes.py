@@ -225,6 +225,20 @@ def get_changes_in_repo(
     return changes
 
 
+def get_repository_changes(cwd: str | Path, ref: str | None = None) -> list[GitChange]:
+    """Return changes owned by one repository, excluding nested worktrees."""
+    root = Path(cwd)
+    return [
+        change
+        for change in get_changes_in_repo(root, ref=ref)
+        if not any(
+            (root / ancestor / ".git").exists()
+            for ancestor in (change.path, *change.path.parents)
+            if ancestor != Path(".")
+        )
+    ]
+
+
 def get_git_changes(cwd: str | Path, ref: str | None = None) -> list[GitChange]:
     git_dirs = {
         os.path.dirname(f)[2:]

@@ -176,7 +176,9 @@ def _show_file_at_rev(repo: Path, rev: str, relative_path: Path) -> str:
         return ""
 
 
-def get_commit_file_diff(file_path: str | Path, commit: str) -> GitDiff:
+def get_commit_file_diff(
+    file_path: str | Path, commit: str, repository: str | Path | None = None
+) -> GitDiff:
     """Get the diff of a single file as changed by one commit.
 
     Both sides come from git objects — never from disk — so files the
@@ -188,6 +190,7 @@ def get_commit_file_diff(file_path: str | Path, commit: str) -> GitDiff:
             directory (absolute paths win the join, mirroring
             ``get_git_diff``).
         commit: The commit to inspect (SHA or abbreviation).
+        repository: Explicit repository root, avoiding nested-repository ambiguity.
 
     Returns:
         GitDiff where ``original`` is the file at the commit's first
@@ -202,7 +205,9 @@ def get_commit_file_diff(file_path: str | Path, commit: str) -> GitDiff:
     """
     path = Path(os.getcwd(), file_path).resolve()
 
-    closest_git_repo = get_closest_git_repo(path)
+    closest_git_repo = (
+        Path(repository).resolve() if repository else get_closest_git_repo(path)
+    )
     if not closest_git_repo:
         raise GitRepositoryError(f"File is not in a git repository: {path}")
     validated_repo = validate_git_repository(closest_git_repo)

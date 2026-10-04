@@ -141,6 +141,7 @@ def test_runtime_git_router_excludes_repository_search():
     assert (
         "/conversations/{runtime_conversation_id}/git/repositories/search" not in paths
     )
+    assert "/conversations/{runtime_conversation_id}/git/repositories" in paths
     assert "/conversations/{runtime_conversation_id}/git/changes" in paths
 
 

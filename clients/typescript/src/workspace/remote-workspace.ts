@@ -211,8 +211,25 @@ export class RemoteWorkspace implements IWorkspace {
     };
   }
 
-  async gitChanges(path: string, options: GitQueryOptions = {}): Promise<GitChange[]> {
+  async gitRepositories(path: string): Promise<{
+    repositories: { path: string }[];
+    truncated: boolean;
+  }> {
+    const response = await this.client.get<{
+      repositories: { path: string }[];
+      truncated: boolean;
+    }>('/api/git/repositories', { params: { path } });
+    return response.data;
+  }
+
+  async gitChanges(
+    path: string,
+    options: GitQueryOptions & { includeNested?: boolean } = {}
+  ): Promise<GitChange[]> {
     const params: Record<string, string> = { path };
+    if (options.includeNested !== undefined) {
+      params.include_nested = String(options.includeNested);
+    }
     if (options.ref !== undefined) {
       params.ref = options.ref;
     }
@@ -229,8 +246,13 @@ export class RemoteWorkspace implements IWorkspace {
     }
   }
 
-  async gitDiff(path: string, options: GitQueryOptions = {}): Promise<GitDiff> {
+  async gitDiff(
+    path: string,
+    options: GitQueryOptions & { commit?: string; repository?: string } = {}
+  ): Promise<GitDiff> {
     const params: Record<string, string> = { path };
+    if (options.commit !== undefined) params.commit = options.commit;
+    if (options.repository !== undefined) params.repository = options.repository;
     if (options.ref !== undefined) {
       params.ref = options.ref;
     }

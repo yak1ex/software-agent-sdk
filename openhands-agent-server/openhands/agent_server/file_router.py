@@ -30,6 +30,7 @@ from openhands.agent_server.config import get_default_config
 from openhands.agent_server.models import Success
 from openhands.agent_server.server_details_router import update_last_execution_time
 from openhands.sdk.git.exceptions import GitCommandError, GitRepositoryError
+from openhands.sdk.git.repositories import WORKSPACE_EXCLUDED_DIRS
 from openhands.sdk.git.utils import (
     GIT_EMPTY_TREE_HASH,
     get_git_repository_metadata,
@@ -64,6 +65,62 @@ class HomeResponse(BaseModel):
 logger = get_logger(__name__)
 file_router = APIRouter(prefix="/file", tags=["Files"])
 file_discovery_router = APIRouter(prefix="/file", tags=["Files"])
+
+
+class WorkspaceFileList(BaseModel):
+    files: list[str]
+    truncated: bool = False
+
+
+def _list_workspace_files(path: str, limit: int) -> WorkspaceFileList:
+    root = Path(path).resolve()
+    if not root.is_dir():
+        raise HTTPException(status_code=400, detail="Path must be a directory")
+    files: list[str] = []
+    visited = 0
+
+    def on_error(error: OSError) -> None:
+        raise HTTPException(
+            status_code=400, detail="Unable to read workspace"
+        ) from error
+
+    for directory, dirs, names in os.walk(root, followlinks=False, onerror=on_error):
+        current = Path(directory)
+        visited += 1
+        if visited > 20000:
+            return WorkspaceFileList(files=files, truncated=True)
+        dirs[:] = sorted(
+            name
+            for name in dirs
+            if name not in WORKSPACE_EXCLUDED_DIRS
+            and not (current / name).is_symlink()
+            and not (current / name).is_junction()
+        )
+        for name in sorted(names):
+            file = current / name
+            if name == ".git" or file.is_symlink() or not file.is_file():
+                continue
+            if len(files) == limit:
+                return WorkspaceFileList(files=files, truncated=True)
+            files.append(file.relative_to(root).as_posix())
+    return WorkspaceFileList(files=files)
+
+
+@file_router.get("/list")
+async def list_workspace_files(
+    path: str = Query(..., description="Workspace directory"),
+    limit: int = Query(2000, ge=1, le=20000),
+) -> WorkspaceFileList:
+    """List workspace-relative files without invoking a shell.
+
+    Traversal excludes build/vendor directories and symbolic links. Results are
+    bounded by the file limit and 20,000 visited directories; truncated signals
+    either bound. Filenames and whitespace are preserved verbatim.
+    """
+    update_last_execution_time()
+    return await asyncio.to_thread(_list_workspace_files, path, limit)
+
+
 _FILE_DOWNLOAD_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {
         "content": {

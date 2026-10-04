@@ -9,7 +9,7 @@ import logging
 import os
 from pathlib import Path
 
-from openhands.sdk.git.exceptions import GitCommandError, GitError
+from openhands.sdk.git.exceptions import GitCommandError, GitError, GitRepositoryError
 from openhands.sdk.git.models import GitChange, GitChangeStatus
 from openhands.sdk.git.utils import (
     get_valid_ref,
@@ -215,6 +215,20 @@ def get_changes_in_repo(
     return changes
 
 
+def get_repository_changes(cwd: str | Path, ref: str | None = None) -> list[GitChange]:
+    """Return changes owned by one repository, excluding nested worktrees."""
+    root = Path(cwd)
+    return [
+        change
+        for change in get_changes_in_repo(root, ref=ref)
+        if not any(
+            (root / ancestor / ".git").exists()
+            for ancestor in (change.path, *change.path.parents)
+            if ancestor != Path(".")
+        )
+    ]
+
+
 def get_git_changes(cwd: str | Path, ref: str | None = None) -> list[GitChange]:
     git_dirs = {
         os.path.dirname(f)[2:]
@@ -222,7 +236,12 @@ def get_git_changes(cwd: str | Path, ref: str | None = None) -> list[GitChange]:
     }
 
     # First try the workspace directory
-    changes = get_changes_in_repo(cwd, ref=ref)
+    try:
+        changes = get_changes_in_repo(cwd, ref=ref)
+    except GitRepositoryError:
+        if not git_dirs:
+            raise
+        changes = []
 
     # Filter out any changes which are inside one of the nested repositories.
     # This compares path ancestry rather than string prefixes: a nested

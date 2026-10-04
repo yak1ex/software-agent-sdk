@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException, Path as PathParam, Query
 
 from openhands.agent_server.server_details_router import update_last_execution_time
 from openhands.sdk.git.exceptions import GitError, GitRepositoryError
-from openhands.sdk.git.git_changes import get_git_changes
+from openhands.sdk.git.git_changes import get_git_changes, get_repository_changes
 from openhands.sdk.git.git_commits import (
     get_commit_changes,
     get_commit_file_diff,
@@ -17,6 +17,7 @@ from openhands.sdk.git.git_commits import (
 )
 from openhands.sdk.git.git_diff import get_git_diff
 from openhands.sdk.git.models import GitChange, GitCommitsPage, GitDiff
+from openhands.sdk.git.repositories import WorkspaceRepositories, discover_repositories
 
 
 git_router = APIRouter(prefix="/git", tags=["Git"])
@@ -40,13 +41,20 @@ _COMMIT_QUERY_DESCRIPTION = (
 _SHA_PATTERN = r"^[0-9a-fA-F]{4,64}$"
 
 
-async def _get_git_changes(path: str, ref: str | None) -> list[GitChange]:
+async def _get_git_changes(
+    path: str, ref: str | None, include_nested: bool = True
+) -> list[GitChange]:
     """Internal helper to get git changes for a given path."""
     update_last_execution_time()
     loop = asyncio.get_running_loop()
     try:
         return await loop.run_in_executor(
-            None, functools.partial(get_git_changes, Path(path), ref=ref)
+            None,
+            functools.partial(
+                get_git_changes if include_nested else get_repository_changes,
+                Path(path),
+                ref=ref,
+            ),
         )
     except GitRepositoryError:
         # A non-repo workspace has no git changes to report; respond with an
@@ -99,13 +107,21 @@ async def _get_commit_changes(path: str, sha: str) -> list[GitChange]:
         return []
 
 
-async def _get_commit_file_diff(path: str, commit: str) -> GitDiff:
+async def _get_commit_file_diff(
+    path: str, commit: str, repository: str | None = None
+) -> GitDiff:
     """Internal helper to get one file's diff as changed by one commit."""
     update_last_execution_time()
     loop = asyncio.get_running_loop()
     try:
         return await loop.run_in_executor(
-            None, functools.partial(get_commit_file_diff, Path(path), commit)
+            None,
+            functools.partial(
+                get_commit_file_diff,
+                Path(path),
+                commit,
+                **({"repository": repository} if repository is not None else {}),
+            ),
         )
     except GitRepositoryError:
         logger.debug("Path %s is not in a git repository; returning empty diff", path)
@@ -116,16 +132,37 @@ async def _get_commit_file_diff(path: str, commit: str) -> GitDiff:
 async def git_changes_query(
     path: str = Query(..., description="The git repository path"),
     ref: str | None = Query(None, description=_REF_QUERY_DESCRIPTION),
+    include_nested: bool = Query(True, description="Include nested repository changes"),
 ) -> list[GitChange]:
     """Get git changes using query parameter (preferred method)."""
     try:
-        return await _get_git_changes(path, ref)
+        return await _get_git_changes(path, ref, include_nested)
     except GitError as e:
         # GitRepositoryError is already handled in the helper (returns []).
         # Any remaining GitError subclass (e.g. GitCommandError) surfaces as
         # 400 so the client can show an actionable error instead of an
         # opaque 500.
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@git_router.get("/repositories")
+async def git_repositories_query(
+    path: str = Query(..., description="Workspace directory"),
+    max_depth: int = Query(6, ge=0, le=20),
+    limit: int = Query(200, ge=1, le=1000),
+) -> WorkspaceRepositories:
+    """Discover workspace-relative repository roots, including Git worktrees.
+
+    The workspace need not itself be a repository. Symlinks and vendor/build
+    directories are excluded. Truncated indicates a depth, count or scan bound.
+    """
+    update_last_execution_time()
+    try:
+        return await asyncio.to_thread(
+            discover_repositories, Path(path), max_depth, limit
+        )
+    except GitError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @git_router.get("/diff")
@@ -135,6 +172,9 @@ async def git_diff_query(
     commit: str | None = Query(
         None, pattern=_SHA_PATTERN, description=_COMMIT_QUERY_DESCRIPTION
     ),
+    repository: str | None = Query(
+        None, description="Explicit repository root for commit diffs"
+    ),
 ) -> GitDiff:
     """Get git diff using query parameter (preferred method)."""
     if ref is not None and commit is not None:
@@ -143,7 +183,7 @@ async def git_diff_query(
         )
     try:
         if commit is not None:
-            return await _get_commit_file_diff(path, commit)
+            return await _get_commit_file_diff(path, commit, repository)
         return await _get_git_diff(path, ref)
     except GitError as e:
         # GitRepositoryError is already handled in the helpers (returns an

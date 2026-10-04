@@ -13,6 +13,11 @@ export type FileClientOptions = RuntimeServiceClientOptions;
 
 export type FileUploadContent = string | Blob | File;
 
+export interface WorkspaceFileList {
+  files: string[];
+  truncated: boolean;
+}
+
 export class FileClient {
   public readonly host: string;
   public readonly apiKey?: string;
@@ -55,6 +60,13 @@ export class FileClient {
     const response = await this.runtimeClient.get<ArrayBuffer>('/api/file/download', {
       params: { path },
       responseType: 'arrayBuffer',
+    });
+    return response.data;
+  }
+
+  async listFiles(path: string, limit = 2000): Promise<WorkspaceFileList> {
+    const response = await this.runtimeClient.get<WorkspaceFileList>('/api/file/list', {
+      params: { path, limit },
     });
     return response.data;
   }

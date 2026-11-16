@@ -189,6 +189,27 @@ _ACP_AUTH_TIMEOUT: float = float(os.environ.get("ACP_AUTH_TIMEOUT", "30.0"))
 _ACP_NPX_CACHE_WARM_TIMEOUT: float = float(
     os.environ.get("ACP_NPX_CACHE_WARM_TIMEOUT", "300")
 )
+
+# How long an npx-launched provider's registry metadata may go without being
+# revalidated. A pin bump whose dependency version postdates the cached
+# packument is invisible to the launch, which resolves with ``--prefer-offline``
+# (npm serves the stored body instead of refetching), so the warm revalidates
+# whenever the pin set changed or this much time passed since the last
+# successful refresh. Env-tunable; 0 forces a revalidation on every start.
+_ACP_NPX_REFRESH_TTL_SECONDS: float = float(
+    os.environ.get("ACP_NPX_REFRESH_TTL_SECONDS", "86400")
+)
+
+# Startup attempts per conversation start. The second exists only to re-run an
+# npx launch whose dependency resolution failed against stale metadata, with
+# online metadata instead (see :meth:`ACPAgent._start_acp_server`).
+_ACP_STARTUP_MAX_ATTEMPTS: int = int(os.environ.get("ACP_STARTUP_MAX_ATTEMPTS", "2"))
+
+# npm output retained per startup attempt, enough to name the failure
+# (``npm error code ETARGET`` plus the ``notarget`` line that follows it) without
+# growing with a chatty CLI.
+_ACP_NPX_STDERR_TAIL_LINES: Final[int] = 40
+
 _ACP_VERSION_RE = re.compile(r"v?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)")
 
 _ACP_PROMPT_RETRY_DELAYS: tuple[float, ...] = (5.0, 15.0, 30.0)  # seconds
@@ -524,6 +545,77 @@ def _npx_packages(command: list[str]) -> list[str]:
         if not arg.startswith("-"):
             return [arg]
     return []
+
+
+def _resolve_acp_executable(command: str, env: dict[str, str]) -> str:
+    """Resolve an ACP launch command to something CreateProcess can execute.
+
+    On Windows the npm-family launchers are command shims (``npx`` arrives as
+    ``npx.cmd``) and CreateProcess appends only ``.exe``, so spawning the bare
+    name raises ``[WinError 2]`` even when the tool is installed and on ``PATH``.
+    Resolving through :func:`shutil.which` yields a path whose extension is
+    explicit, which CreateProcess will run.
+
+    Returns ``command`` unchanged when it cannot be resolved, so a custom or
+    double-intercepted launch keeps the subprocess API's existing error behavior
+    (and tests still see the command they passed in).
+    """
+    return shutil.which(command, path=env.get("PATH", "")) or command
+
+
+#: npm's own words for "the version this pin needs is not in the metadata I have".
+#: Two causes share the wording: the cached packument predates the pinned
+#: dependency version, or a ``before`` / ``min-release-age`` filter left no
+#: candidate. Only the first is healed by refetching, but the second costs one
+#: extra startup to rule out, so both take the retry.
+_NPX_RESOLUTION_FAILURE_MARKERS: tuple[str, ...] = (
+    "ETARGET",
+    "ENOVERSIONS",
+    "No matching version found",
+    "No versions available",
+    "notarget",
+)
+
+
+def _npx_resolution_failure(lines: Sequence[str]) -> bool:
+    """True when captured npm output means version/metadata resolution failed."""
+    return any(
+        marker in line for line in lines for marker in _NPX_RESOLUTION_FAILURE_MARKERS
+    )
+
+
+def _npm_failure_detail(lines: Sequence[str]) -> str:
+    """The npm error lines from ``lines``, joined for one log/error message.
+
+    ``npx`` reports an install failure entirely on stderr and then exits, so the
+    ACP handshake dies as a bare "Connection closed" while the reason — the
+    launcher's own ``npm error`` block — goes unreported. Pulling just the error
+    lines keeps the message about the failure instead of the CLI's whole log.
+    Returns "" when nothing looks like an npm error, leaving the caller's
+    original exception to speak for itself.
+    """
+    errors = [
+        redact_text_secrets(line.strip())
+        for line in lines
+        if line.strip().startswith(("npm error", "npm ERR!"))
+    ]
+    return " | ".join(errors[-3:])
+
+
+def _npx_online_fetch_args(args: Sequence[str]) -> list[str] | None:
+    """``args`` rewritten so npm refetches metadata instead of trusting its cache.
+
+    ``--prefer-offline`` returns the stored packument even once it is past its
+    ``max-age``, which is exactly what makes a newly bumped pin unresolvable;
+    ``--prefer-online`` forces the refetch. Returns ``None`` when the arguments
+    already force online metadata, because retrying them would spawn the same
+    command twice for nothing.
+    """
+    if "--prefer-online" in args:
+        return None
+    if "--prefer-offline" in args:
+        return ["--prefer-online" if arg == "--prefer-offline" else arg for arg in args]
+    return ["--prefer-online", *args]
 
 
 def _with_codex_base_url(
@@ -1206,16 +1298,27 @@ async def _filter_jsonrpc_lines(source: Any, dest: Any) -> None:
         dest.feed_eof()
 
 
-async def _log_acp_subprocess_stderr(source: Any) -> None:
+async def _log_acp_subprocess_stderr(
+    source: Any, sink: list[str] | None = None
+) -> None:
+    """Log the ACP subprocess' stderr, optionally retaining a bounded tail.
+
+    ``sink`` exists because a launcher that dies before the handshake explains
+    itself here and nowhere else: npm reports an install failure on stderr, then
+    exits, and the caller only sees the closed pipe. Startup passes a list to
+    keep the last lines for its own diagnosis after the task has finished.
+    """
     try:
         while line := await source.readline():
-            logger.info(
-                "ACP stderr: %s",
-                maybe_truncate(
-                    redact_text_secrets(line.decode(errors="replace").rstrip()),
-                    truncate_after=_ACP_SUBPROCESS_LOG_LINE_CHARS,
-                ),
+            text = maybe_truncate(
+                redact_text_secrets(line.decode(errors="replace").rstrip()),
+                truncate_after=_ACP_SUBPROCESS_LOG_LINE_CHARS,
             )
+            logger.info("ACP stderr: %s", text)
+            if sink is not None:
+                if len(sink) >= _ACP_NPX_STDERR_TAIL_LINES:
+                    sink.pop(0)
+                sink.append(text)
     except Exception:
         logger.debug("_log_acp_subprocess_stderr stopped", exc_info=True)
 
@@ -2791,18 +2894,31 @@ class ACPAgent(AgentBase):
         provider_key: str,
         env: dict[str, str],
         cwd: str,
+        *,
+        revalidate: bool = False,
     ) -> None:
+        """Pre-resolve an npx provider's pinned package(s) into the durable cache.
+
+        ``revalidate`` asks npm to refetch registry metadata rather than trust
+        what it already cached — see :meth:`_npx_refresh_due`. Failures raise
+        rather than log because the caller treats warming as best-effort, and
+        npm's own error lines ride along with the exception: without them the
+        reason an install failed is only ever findable in ``<npm-cache>/_logs``.
+        """
         logger.info(
             "Warming ACP provider npx cache: provider=%s, packages=%s; "
-            "first use may download the provider before session startup",
+            "first use may download the provider before session startup%s",
             provider_key,
             list(packages),
+            " (revalidating registry metadata)" if revalidate else "",
         )
         package_args = [arg for package in packages for arg in ("--package", package)]
         process = await asyncio.create_subprocess_exec(
-            "npx",
+            # Resolved exactly like the launch itself: on Windows this is
+            # ``npx.cmd``, which CreateProcess will not find under the bare name.
+            _resolve_acp_executable("npx", env),
             "--yes",
-            "--prefer-offline",
+            "--prefer-online" if revalidate else "--prefer-offline",
             *package_args,
             "--",
             "node",
@@ -2812,10 +2928,14 @@ class ACPAgent(AgentBase):
             env=env,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
         try:
-            await asyncio.wait_for(process.wait(), timeout=_ACP_NPX_CACHE_WARM_TIMEOUT)
+            # communicate(), not wait(): stderr is a pipe now, and a verbose npm
+            # can fill the buffer and block the exit we are waiting for.
+            _, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=_ACP_NPX_CACHE_WARM_TIMEOUT
+            )
         except TimeoutError as exc:
             process.kill()
             await process.wait()
@@ -2824,10 +2944,76 @@ class ACPAgent(AgentBase):
                 f"{_ACP_NPX_CACHE_WARM_TIMEOUT:.0f}s for {provider_key}"
             ) from exc
         if process.returncode:
+            detail = _npm_failure_detail(
+                (stderr or b"").decode(errors="replace").splitlines()
+            )
             raise RuntimeError(
                 f"ACP provider cache warm failed for {provider_key} "
-                f"(exit code {process.returncode})"
+                f"(exit code {process.returncode})" + (f": {detail}" if detail else "")
             )
+
+    def _acp_npx_refresh_marker(self, state: ConversationState) -> Path:
+        """Path of the record of the last npx metadata refresh.
+
+        Sits beside the npm cache it describes (``_acp_npm_cache_dir``'s parent),
+        so a sandbox that loses one loses the other and refreshes together.
+        """
+        return self._acp_npm_cache_dir(state).parent / "acp-npx-refresh.json"
+
+    def _npx_refresh_due(
+        self, state: ConversationState, provider_key: str, packages: Sequence[str]
+    ) -> bool:
+        """Whether this launch must revalidate registry metadata before starting.
+
+        ``--prefer-offline`` makes the provider invisible to any dependency
+        version published after the cached packument was written, so a pin bump
+        — or simply the passage of :data:`_ACP_NPX_REFRESH_TTL_SECONDS` — is
+        answered with one online warm instead of a startup that dies inside
+        ``npx``.
+
+        Anything unreadable counts as due: the check guards against a stale
+        cache, and re-validating costs startup time while skipping it can cost
+        the conversation.
+        """
+        marker = self._acp_npx_refresh_marker(state)
+        wanted = sorted(packages)
+        try:
+            recorded = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return True
+        if not isinstance(recorded, dict):
+            return True
+        if (
+            recorded.get("provider") != provider_key
+            or sorted(recorded.get("packages") or []) != wanted
+        ):
+            return True
+        refreshed_at = recorded.get("refreshed_at")
+        if not isinstance(refreshed_at, (int, float)):
+            return True
+        return (time.time() - float(refreshed_at)) >= _ACP_NPX_REFRESH_TTL_SECONDS
+
+    def _record_npx_refresh(
+        self, state: ConversationState, provider_key: str, packages: Sequence[str]
+    ) -> None:
+        """Note that ``packages`` were resolved against current registry metadata.
+
+        Best-effort by design: a cache this process cannot write (read-only
+        mount) only means the next start revalidates again, so no failure here
+        may reach the conversation that is in the middle of starting.
+        """
+        marker = self._acp_npx_refresh_marker(state)
+        payload = json.dumps(
+            {
+                "provider": provider_key,
+                "packages": sorted(packages),
+                "refreshed_at": time.time(),
+            }
+        )
+        try:
+            marker.write_text(payload, encoding="utf-8")
+        except OSError as exc:
+            logger.debug("Could not record ACP npx refresh marker %s: %s", marker, exc)
 
     def _isolate_acp_data_dir(
         self, state: ConversationState, env: dict[str, str]
@@ -3223,9 +3409,16 @@ class ACPAgent(AgentBase):
         packages = _npx_packages(self.acp_command)
         if provider is not None and packages:
             env["npm_config_cache"] = str(self._acp_npm_cache_dir(state))
+            revalidate = self._npx_refresh_due(state, provider.key, packages)
             try:
                 self._executor.run_async(
-                    self._warm_npx_cache(packages, provider.key, env, working_dir),
+                    self._warm_npx_cache(
+                        packages,
+                        provider.key,
+                        env,
+                        working_dir,
+                        revalidate=revalidate,
+                    ),
                     timeout=_ACP_NPX_CACHE_WARM_TIMEOUT + 5,
                 )
             except Exception as error:
@@ -3235,6 +3428,9 @@ class ACPAgent(AgentBase):
                     provider.key,
                     error,
                 )
+            else:
+                if revalidate:
+                    self._record_npx_refresh(state, provider.key, packages)
 
         # Prior ACP session id — typically survives agent-server restarts via
         # ConversationState.agent_state (serialized into base_state.json).
@@ -3291,7 +3487,15 @@ class ACPAgent(AgentBase):
         # such as ``.cmd`` files. Preserve the original command when it cannot
         # be resolved so custom commands retain the subprocess API's existing
         # error behavior (and test doubles can still intercept the launch).
-        _resolved_command = shutil.which(command, path=env.get("PATH", "")) or command
+        _resolved_command = _resolve_acp_executable(command, env)
+
+        # Two cells the startup attempts below share with ``_init``: the argument
+        # list (an online retry swaps the offline-preference flag) and the tail of
+        # the child's stderr, which is the only place an install failure explains
+        # itself. Both are mutated in place rather than passed in, so ``_init``
+        # stays the zero-argument coroutine ``run_async`` expects.
+        _launch_args = list(args)
+        _stderr_tail: list[str] = []
 
         async def _init() -> tuple[
             str,
@@ -3308,7 +3512,7 @@ class ACPAgent(AgentBase):
             # stdout.
             process = await asyncio.create_subprocess_exec(
                 _resolved_command,
-                *args,
+                *_launch_args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -3326,7 +3530,7 @@ class ACPAgent(AgentBase):
                 _filter_jsonrpc_lines(process.stdout, filtered_reader)
             )
             stderr_log_task = asyncio.get_event_loop().create_task(
-                _log_acp_subprocess_stderr(process.stderr)
+                _log_acp_subprocess_stderr(process.stderr, sink=_stderr_tail)
             )
 
             conn = _ACPClientConnection(
@@ -3626,22 +3830,116 @@ class ACPAgent(AgentBase):
         # _conn / _process / _filtered_reader are assigned to the instance inside
         # _init() so a mid-init failure can be cleaned up; only the
         # success-only fields (including the resolved model state) are returned.
-        try:
-            (
-                self._session_id,
-                self._agent_name,
-                self._agent_version,
-                self._current_model_id,
-                self._available_models,
-                self._model_override_applied,
-                self._effort_state,
-            ) = self._executor.run_async(_init, timeout=self.acp_startup_timeout)
-        except TimeoutError:
-            # run_async's own TimeoutError carries no message (anyio.fail_after);
-            # raise a descriptive one so _acp_error_detail (str(exc)) isn't blank.
-            raise TimeoutError(self._startup_timeout_message()) from None
+        #
+        # The retry loop covers one specific failure class: an npx launch resolves
+        # the pinned provider out of npm's *cached* registry metadata, so a bump
+        # whose dependency version postdates that cache makes npx exit before the
+        # ACP server says a word. The handshake then reports only
+        # "Connection closed", and npm's reason sits in <npm-cache>/_logs. When the
+        # child's stderr names that reason, start again with online metadata.
+        for attempt in range(1, _ACP_STARTUP_MAX_ATTEMPTS + 1):
+            _stderr_tail.clear()
+            try:
+                (
+                    self._session_id,
+                    self._agent_name,
+                    self._agent_version,
+                    self._current_model_id,
+                    self._available_models,
+                    self._model_override_applied,
+                    self._effort_state,
+                ) = self._executor.run_async(_init, timeout=self.acp_startup_timeout)
+            except TimeoutError:
+                # run_async's own TimeoutError carries no message (anyio.fail_after);
+                # raise a descriptive one so _acp_error_detail (str(exc)) isn't blank.
+                raise TimeoutError(self._startup_timeout_message()) from None
+            except Exception as exc:
+                # The stderr reader runs on the portal loop and can lag the EOF that
+                # just failed the handshake; let it drain before deciding what the
+                # launcher actually said.
+                with contextlib.suppress(Exception):
+                    self._executor.run_async(asyncio.sleep(0.25), timeout=2.0)
+                detail = _npm_failure_detail(_stderr_tail)
+                online_args = (
+                    _npx_online_fetch_args(_launch_args)
+                    if packages and _npx_resolution_failure(_stderr_tail)
+                    else None
+                )
+                if online_args is None or attempt >= _ACP_STARTUP_MAX_ATTEMPTS:
+                    # Re-raising the launcher's reason instead of the closed pipe
+                    # keeps the same ConversationErrorEvent code (ACPInitError) but
+                    # finally gives the detail the user can act on.
+                    if detail:
+                        raise RuntimeError(
+                            f"ACP provider failed to start via npx "
+                            f"(provider={provider.key if provider else 'custom'}): "
+                            f"{detail}"
+                        ) from exc
+                    raise
+                logger.warning(
+                    "ACP provider npx could not resolve its pinned package from "
+                    "cached registry metadata (provider=%s); retrying startup with "
+                    "online metadata: %s",
+                    provider.key if provider else "custom",
+                    detail,
+                )
+                self._discard_acp_attempt()
+                _launch_args[:] = online_args
+                continue
+            if attempt > 1 and provider is not None and packages:
+                # The online retry did what the warm would have: the cache now
+                # holds current metadata, so the next start may trust offline again.
+                self._record_npx_refresh(state, provider.key, packages)
+            break
         self._working_dir = working_dir
         self._flush_file_credentials_blocking()
+
+    def _discard_acp_attempt(self) -> None:
+        """Tear down the subprocess and connection left by a failed startup attempt.
+
+        Deliberately narrower than :meth:`_cleanup`, which closes the executor and
+        releases materialised file credentials — the retry needs both, since it
+        re-enters ``run_async`` and re-authenticates with the same auth file. The
+        failure this serves is an npx install that exits before the handshake, so
+        the child is already dead; this closes the connection around it, reaps the
+        process if it somehow survived, and stops the pipe tasks so their state
+        does not carry into the next attempt.
+        """
+        conn = self._conn
+        if conn is not None:
+            try:
+                self._executor.run_async(conn.close, timeout=5.0)
+            except Exception as e:
+                logger.debug("Error closing ACP connection after attempt: %s", e)
+            self._conn = None
+
+        process = self._process
+        if process is not None:
+            try:
+                if process.returncode is None:
+                    process.terminate()
+                self._executor.run_async(self._wait_for_process, process, timeout=5.0)
+            except Exception as e:
+                logger.debug("Error reaping ACP process after attempt: %s", e)
+                with contextlib.suppress(Exception):
+                    process.kill()
+            self._process = None
+
+        for task_name, task in (
+            ("stdout filter", self._stdout_filter_task),
+            ("stderr log", self._stderr_log_task),
+        ):
+            if task is None:
+                continue
+            task.cancel()
+            try:
+                self._executor.run_async(self._await_cancelled_task, task, timeout=5.0)
+            except Exception as e:
+                logger.debug(
+                    "Error stopping ACP %s task after attempt: %s", task_name, e
+                )
+        self._stdout_filter_task = None
+        self._stderr_log_task = None
 
     def _reset_client_for_turn(
         self,

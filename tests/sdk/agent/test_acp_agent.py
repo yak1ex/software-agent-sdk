@@ -42,7 +42,9 @@ from openhands.sdk.agent.acp_agent import (
     _maybe_set_session_model,
     _mcp_config_to_acp_servers,
     _NewSessionResponse,
+    _npx_online_fetch_args,
     _npx_packages,
+    _npx_resolution_failure,
     _OpenHandsACPBridge,
     _preconfigured_credentials,
     _reapply_session_model_on_resume,
@@ -232,7 +234,7 @@ async def test_warm_npx_cache_passes_every_pinned_package(tmp_path):
     agent = _make_agent()
     process = MagicMock()
     process.returncode = 0
-    process.wait = AsyncMock(return_value=0)
+    process.communicate = AsyncMock(return_value=(None, b""))
 
     with patch(
         "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
@@ -262,7 +264,7 @@ async def test_warm_npx_cache_uses_prefer_offline_and_durable_env(tmp_path):
     agent = _make_agent()
     process = MagicMock()
     process.returncode = 0
-    process.wait = AsyncMock(return_value=0)
+    process.communicate = AsyncMock(return_value=(None, b""))
     env = {"npm_config_cache": str(tmp_path / "npm-cache")}
 
     with patch(
@@ -287,8 +289,152 @@ async def test_warm_npx_cache_uses_prefer_offline_and_durable_env(tmp_path):
         env=env,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
+        # PIPE, not DEVNULL: npm explains an install failure only on stderr, and
+        # the warm's warning is where that reason is most useful.
+        stderr=asyncio.subprocess.PIPE,
     )
+
+
+async def test_warm_npx_cache_revalidates_only_when_asked(tmp_path):
+    """``revalidate`` swaps the offline preference for an online refetch."""
+    agent = _make_agent()
+    process = MagicMock()
+    process.returncode = 0
+    process.communicate = AsyncMock(return_value=(None, b""))
+
+    with patch(
+        "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    ) as create_process:
+        await agent._warm_npx_cache(["codex-acp@2.2.2"], "codex", {}, str(tmp_path))
+        assert create_process.await_args is not None
+        offline_flag = create_process.await_args.args[2]
+
+        await agent._warm_npx_cache(
+            ["codex-acp@2.2.2"], "codex", {}, str(tmp_path), revalidate=True
+        )
+        assert create_process.await_args is not None
+        online_flag = create_process.await_args.args[2]
+
+    assert offline_flag == "--prefer-offline"
+    assert online_flag == "--prefer-online"
+
+
+async def test_warm_npx_cache_resolves_the_npx_command_shim(tmp_path):
+    """Windows installs npm's launcher as ``npx.cmd``.
+
+    CreateProcess appends only ``.exe``, so the bare name raises
+    ``[WinError 2]`` even with npx on PATH — the warm has to resolve it the same
+    way the launch does, or it never runs on Windows.
+    """
+    agent = _make_agent()
+    process = MagicMock()
+    process.returncode = 0
+    process.communicate = AsyncMock(return_value=(None, b""))
+    resolved = str(tmp_path / "nodejs" / "npx.cmd")
+
+    with (
+        patch(
+            "openhands.sdk.agent.acp_agent.shutil.which", return_value=resolved
+        ) as which,
+        patch(
+            "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=process),
+        ) as create_process,
+    ):
+        await agent._warm_npx_cache(
+            ["codex-acp@2.2.2"],
+            "codex",
+            {"PATH": str(tmp_path / "nodejs")},
+            str(tmp_path),
+        )
+
+    assert create_process.await_args is not None
+    assert create_process.await_args.args[0] == resolved
+    which.assert_called_once_with("npx", path=str(tmp_path / "nodejs"))
+
+
+async def test_warm_npx_cache_reports_npm_error_lines(tmp_path):
+    """The warm failure carries npm's reason, not just its exit code."""
+    agent = _make_agent()
+    process = MagicMock()
+    process.returncode = 1
+    process.communicate = AsyncMock(
+        return_value=(
+            None,
+            b"npm error code ETARGET\n"
+            b"npm error notarget No matching version found for @openai/codex@^0.160.1\n"
+            b"npm verbose exit 1\n",
+        )
+    )
+
+    with patch(
+        "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    ):
+        with pytest.raises(RuntimeError) as excinfo:
+            await agent._warm_npx_cache(["codex-acp@2.2.2"], "codex", {}, str(tmp_path))
+
+    message = str(excinfo.value)
+    assert "exit code 1" in message
+    assert "npm error code ETARGET" in message
+    assert "npm verbose" not in message
+
+
+def test_npx_refresh_due_tracks_pin_changes_and_age(tmp_path):
+    """Metadata is revalidated when the pins changed or the cache may be old."""
+    agent = _make_agent()
+    state = _make_state(tmp_path)
+    packages = ["@agentclientprotocol/codex-acp@2.2.2"]
+    marker = agent._acp_npx_refresh_marker(state)
+
+    # Nothing recorded yet: the cache's vintage is unknown, so refresh.
+    assert agent._npx_refresh_due(state, "codex", packages) is True
+
+    agent._record_npx_refresh(state, "codex", packages)
+    assert agent._npx_refresh_due(state, "codex", packages) is False
+
+    # The pin moved under the marker: the new dependency range may postdate the
+    # cached packument, so this is exactly the bump that must revalidate.
+    moved = ["@agentclientprotocol/codex-acp@2.3.0"]
+    assert agent._npx_refresh_due(state, "codex", moved) is True
+
+    # Same pins, but the TTL has passed.
+    agent._record_npx_refresh(state, "codex", packages)
+    recorded = json.loads(marker.read_text(encoding="utf-8"))
+    recorded["refreshed_at"] -= acp_agent_module._ACP_NPX_REFRESH_TTL_SECONDS + 1
+    marker.write_text(json.dumps(recorded), encoding="utf-8")
+    assert agent._npx_refresh_due(state, "codex", packages) is True
+
+    # A damaged marker cannot vouch for the cache either.
+    marker.write_text("{not json", encoding="utf-8")
+    assert agent._npx_refresh_due(state, "codex", packages) is True
+
+
+def test_npx_online_fetch_args_rewrites_the_preference():
+    pinned = ["-y", "--prefer-offline", "@agentclientprotocol/codex-acp@2.2.2"]
+    assert _npx_online_fetch_args(pinned) == [
+        "-y",
+        "--prefer-online",
+        "@agentclientprotocol/codex-acp@2.2.2",
+    ]
+    # Already forcing online: retrying would spawn the same command twice.
+    assert _npx_online_fetch_args(["-y", "--prefer-online", "pkg@1.0.0"]) is None
+    # No preference recorded: ask for online explicitly.
+    assert _npx_online_fetch_args(["-y", "pkg@1.0.0"]) == [
+        "--prefer-online",
+        "-y",
+        "pkg@1.0.0",
+    ]
+
+
+def test_npx_resolution_failure_reads_npm_markers():
+    assert _npx_resolution_failure(
+        ["npm error code ETARGET", "npm error notarget No matching version found"]
+    )
+    assert _npx_resolution_failure(["npm error code ENOVERSIONS"])
+    assert not _npx_resolution_failure(["node: internal error: something else"])
+    assert not _npx_resolution_failure([])
 
 
 def test_npx_cache_warm_failure_continues_with_normal_startup(tmp_path, caplog):
@@ -326,6 +472,224 @@ def test_npx_cache_warm_failure_continues_with_normal_startup(tmp_path, caplog):
 
     assert "continuing with normal startup" in caplog.text
     conn.initialize.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# npx install failure during startup
+# ---------------------------------------------------------------------------
+
+
+_NPM_ETARGET_LINES = [
+    b"npm error code ETARGET\n",
+    b"npm error notarget No matching version found for @openai/codex@^0.160.1"
+    b" with a date before 2026-11-09\n",
+]
+
+_CODEX_PACKAGES = ["@agentclientprotocol/codex-acp@2.2.2"]
+
+
+def _run_start_with_dying_npx(
+    tmp_path: Path,
+    *,
+    stderr_lines: list[bytes],
+    initialize_effects: list[Any],
+    refresh_recent: bool = False,
+):
+    """Drive the real ``_start_acp_server`` against an npx launcher that dies.
+
+    ``npx`` writes its whole diagnosis to stderr and exits, so the ACP child
+    never speaks: the handshake fails as ``ConnectionError: Connection closed``.
+    Every spawn's argument tuple is recorded so a test can see whether the retry
+    rewired the offline preference.
+
+    ``refresh_recent`` records a fresh metadata refresh first, which keeps the
+    warm from revalidating and leaves the startup retry as the only thing that
+    can rewrite the marker.
+
+    Returns a namespace holding the agent, the state, the connection double, the
+    recorded spawn arguments, the exception startup raised (if any), and whether
+    the executor survived — the retry needs it alive, so that is a claim under
+    test rather than an implementation detail. The executor is always closed here.
+    """
+    from contextlib import ExitStack
+
+    from openhands.sdk.utils.async_executor import AsyncExecutor
+
+    agent = ACPAgent(
+        acp_command=["npx", "-y", "--prefer-offline", *_CODEX_PACKAGES],
+        acp_server="codex",
+    )
+    state = ConversationState.create(
+        id=uuid.uuid4(),
+        agent=agent,
+        workspace=LocalWorkspace(working_dir=str(tmp_path)),
+    )
+    if refresh_recent:
+        agent._record_npx_refresh(state, "codex", _CODEX_PACKAGES)
+
+    class _Stderr:
+        """Minimal stand-in for the subprocess stderr pipe."""
+
+        def __init__(self, lines: list[bytes]):
+            self._lines = list(lines)
+
+        async def readline(self) -> bytes:
+            return self._lines.pop(0) if self._lines else b""
+
+    conn = TestACPSessionIdPersistence._make_conn()
+    conn.initialize = AsyncMock(side_effect=initialize_effects)
+
+    spawn_calls: list[tuple[str, ...]] = []
+
+    async def _fake_exec(*args, **_kwargs):
+        spawn_calls.append(tuple(args))
+        process = MagicMock(spec=asyncio.subprocess.Process)
+        process.returncode = None
+        process.terminate = MagicMock()
+        process.wait = AsyncMock(return_value=1)
+        process.stdin = MagicMock()
+        process.stdout = MagicMock()
+        process.stderr = _Stderr(stderr_lines)
+        return process
+
+    async def _fake_filter(_src, _dst):
+        return None
+
+    agent._executor = AsyncExecutor()
+    result = SimpleNamespace(
+        agent=agent,
+        state=state,
+        conn=conn,
+        spawn_calls=spawn_calls,
+        raised=None,
+        executor_alive=False,
+    )
+    try:
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch(
+                    "openhands.sdk.agent.acp_agent.asyncio.create_subprocess_exec",
+                    new=_fake_exec,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "openhands.sdk.agent.acp_agent._ACPClientConnection",
+                    return_value=conn,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "openhands.sdk.agent.acp_agent._filter_jsonrpc_lines",
+                    new=_fake_filter,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "openhands.sdk.agent.acp_agent.asyncio.StreamReader",
+                    return_value=MagicMock(),
+                )
+            )
+            # Warming is a real npx run; these tests are about the launch.
+            stack.enter_context(
+                patch.object(ACPAgent, "_warm_npx_cache", new=AsyncMock())
+            )
+            agent._start_acp_server(state)
+    except Exception as exc:  # captured, not re-raised: see the docstring
+        result.raised = exc
+    finally:
+        result.executor_alive = agent._executor is not None
+        agent._unregister_atexit_cleanup()
+        if agent._executor is not None:
+            agent._executor.close()
+            agent._executor = None
+    return result
+
+
+def _codex_init_response() -> MagicMock:
+    """An ``initialize`` response naming the codex adapter the pin installs."""
+    response = MagicMock()
+    response.agent_info = MagicMock()
+    response.agent_info.name = "codex-acp"
+    response.agent_info.version = "2.2.2"
+    response.auth_methods = []
+    return response
+
+
+def test_start_acp_server_retries_npx_stale_cache_failure(tmp_path, caplog):
+    """An npx resolution failure gets one startup attempt with online metadata.
+
+    The launcher resolves the pin out of npm's cached packument, so a bumped
+    dependency version is invisible to it; refetching is what makes the same
+    command start (npx exit 1 in production, ``Connection closed`` downstream).
+    """
+    with caplog.at_level("WARNING"):
+        result = _run_start_with_dying_npx(
+            tmp_path,
+            stderr_lines=_NPM_ETARGET_LINES,
+            initialize_effects=[
+                ConnectionError("Connection closed"),
+                _codex_init_response(),
+            ],
+            refresh_recent=True,
+        )
+
+    assert result.raised is None
+    # The retry re-enters run_async, so it must not have closed the executor.
+    assert result.executor_alive is True
+    assert result.conn.initialize.await_count == 2
+    assert len(result.spawn_calls) == 2
+    assert "--prefer-offline" in result.spawn_calls[0]
+    assert "--prefer-online" in result.spawn_calls[1]
+    assert "--prefer-offline" not in result.spawn_calls[1]
+    assert "retrying startup with online metadata" in caplog.text
+    assert "npm error code ETARGET" in caplog.text
+    # The online attempt is what warmed the cache, so record it for next start.
+    recorded = json.loads(
+        Path(result.agent._acp_npx_refresh_marker(result.state)).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert time.time() - recorded["refreshed_at"] < 60
+
+
+def test_start_acp_server_reports_npm_reason_when_retry_also_fails(tmp_path):
+    """After the retry, the launcher's reason replaces the useless handshake error.
+
+    ``ConnectionError`` classifies as ``ACPInitError`` either way; what changes is
+    the detail the client gets to read.
+    """
+    result = _run_start_with_dying_npx(
+        tmp_path,
+        stderr_lines=_NPM_ETARGET_LINES,
+        initialize_effects=[
+            ConnectionError("Connection closed"),
+            ConnectionError("Connection closed"),
+        ],
+    )
+
+    assert isinstance(result.raised, RuntimeError)
+    assert isinstance(result.raised.__cause__, ConnectionError)
+    message = str(result.raised)
+    assert "npm error code ETARGET" in message
+    assert "provider=codex" in message
+    assert _classify_acp_init_error(result.raised) == "ACPInitError"
+    assert len(result.spawn_calls) == 2
+
+
+def test_start_acp_server_does_not_retry_unrelated_failure(tmp_path):
+    """Nothing outside npm's version-resolution markers buys a second spawn."""
+    result = _run_start_with_dying_npx(
+        tmp_path,
+        stderr_lines=[b"node: internal error: bad worker\n"],
+        initialize_effects=[ConnectionError("Connection closed")],
+    )
+
+    # The original exception keeps its identity: no npm install failed here, so
+    # neither the error nor the spawn count changes.
+    assert isinstance(result.raised, ConnectionError)
+    assert len(result.spawn_calls) == 1
+    assert result.conn.initialize.await_count == 1
 
 
 # ---------------------------------------------------------------------------

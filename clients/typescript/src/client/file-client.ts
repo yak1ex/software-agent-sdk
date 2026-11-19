@@ -18,6 +18,12 @@ export interface WorkspaceFileList {
   truncated: boolean;
 }
 
+export interface ListWorkspaceFilesOptions {
+  limit?: number;
+  excludedPatterns?: string[];
+  includeSymlinks?: boolean;
+}
+
 export class FileClient {
   public readonly host: string;
   public readonly apiKey?: string;
@@ -65,9 +71,27 @@ export class FileClient {
     return response.data;
   }
 
-  async listFiles(path: string, limit = 2000): Promise<WorkspaceFileList> {
+  async listFiles(
+    path: string,
+    limitOrOptions: number | ListWorkspaceFilesOptions = 2000
+  ): Promise<WorkspaceFileList> {
+    const params: Record<string, unknown> = { path };
+    if (typeof limitOrOptions === 'number') {
+      params.limit = limitOrOptions;
+    } else {
+      if (limitOrOptions.limit !== undefined) {
+        params.limit = limitOrOptions.limit;
+      }
+      if (limitOrOptions.excludedPatterns !== undefined) {
+        params.use_default_excludes = false;
+        params.exclude = limitOrOptions.excludedPatterns;
+      }
+      if (limitOrOptions.includeSymlinks !== undefined) {
+        params.include_symlinks = limitOrOptions.includeSymlinks;
+      }
+    }
     const response = await this.runtimeClient.get<WorkspaceFileList>('/api/file/list', {
-      params: { path, limit },
+      params,
     });
     return response.data;
   }

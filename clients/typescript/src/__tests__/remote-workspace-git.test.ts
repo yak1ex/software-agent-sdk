@@ -36,6 +36,40 @@ describe('RemoteWorkspace git query parameters', () => {
       'false'
     );
   });
+
+  it('forwards file discovery options in FileClient.listFiles', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ files: ['bin/file.txt'], truncated: false }))
+      .mockResolvedValueOnce(jsonResponse({ files: ['a.txt'], truncated: false }));
+    global.fetch = fetchMock as typeof fetch;
+
+    const client = new FileClient({ host: 'http://example.com' });
+    await client.listFiles('C:\\work', {
+      limit: 0,
+      excludedPatterns: ['*/bin', 'obj'],
+      includeSymlinks: true,
+    });
+    await client.listFiles('C:\\work', {
+      limit: 100,
+      excludedPatterns: [],
+      includeSymlinks: false,
+    });
+
+    const first = new URL(fetchMock.mock.calls[0][0] as string);
+    expect(first.pathname).toBe('/api/file/list');
+    expect(first.searchParams.get('path')).toBe('C:\\work');
+    expect(first.searchParams.get('limit')).toBe('0');
+    expect(first.searchParams.get('use_default_excludes')).toBe('false');
+    expect(first.searchParams.getAll('exclude')).toEqual(['*/bin', 'obj']);
+    expect(first.searchParams.get('include_symlinks')).toBe('true');
+
+    const second = new URL(fetchMock.mock.calls[1][0] as string);
+    expect(second.searchParams.get('limit')).toBe('100');
+    expect(second.searchParams.get('use_default_excludes')).toBe('false');
+    expect(second.searchParams.getAll('exclude')).toEqual([]);
+    expect(second.searchParams.get('include_symlinks')).toBe('false');
+  });
   afterEach(() => {
     global.fetch = originalFetch;
     vi.restoreAllMocks();

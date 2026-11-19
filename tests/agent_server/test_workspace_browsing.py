@@ -138,3 +138,126 @@ def test_repository_scoped_changes_and_commit_diff(tmp_path: Path):
         },
     )
     assert response.status_code == 400
+
+
+def test_list_workspace_files_discovery_options(tmp_path: Path):
+    app = FastAPI()
+    app.include_router(file_router, prefix="/api")
+    client = TestClient(app)
+
+    for directory in (
+        "bin",
+        "nested/bin",
+        "obj",
+        "tmp.cache",
+        "node_modules",
+        ".git",
+    ):
+        target = tmp_path / directory
+        target.mkdir(parents=True)
+        (target / "file.txt").write_text(directory)
+    (tmp_path / "instructions.md").write_text("root")
+
+    symlink_created = False
+    try:
+        (tmp_path / "AGENTS.md").symlink_to(tmp_path / "instructions.md")
+        (tmp_path / "dir-link").symlink_to(
+            tmp_path / "nested", target_is_directory=True
+        )
+        symlink_created = True
+    except OSError:
+        symlink_created = False
+
+    # Custom exclusions replace defaults when use_default_excludes=false.
+    response = client.get(
+        "/api/file/list",
+        params={
+            "path": str(tmp_path),
+            "limit": 0,
+            "use_default_excludes": False,
+            "exclude": ["*/bin", "obj", "*.cache", ".git"],
+            "include_symlinks": symlink_created,
+        },
+    )
+    assert response.status_code == 200
+    expected = ["bin/file.txt", "instructions.md", "node_modules/file.txt"]
+    if symlink_created:
+        expected.append("AGENTS.md")
+    assert sorted(response.json()["files"]) == sorted(expected)
+    assert response.json()["truncated"] is False
+
+    # Symlinks are omitted when include_symlinks=false.
+    if symlink_created:
+        no_symlinks = client.get(
+            "/api/file/list",
+            params={
+                "path": str(tmp_path),
+                "limit": 0,
+                "use_default_excludes": False,
+                "exclude": ["*/bin", "obj", "*.cache", ".git"],
+                "include_symlinks": False,
+            },
+        )
+        assert no_symlinks.status_code == 200
+        assert "AGENTS.md" not in no_symlinks.json()["files"]
+
+    # Empty exclusion list (use_default_excludes=false, no exclude) keeps all dirs.
+    unfiltered = client.get(
+        "/api/file/list",
+        params={
+            "path": str(tmp_path),
+            "limit": 0,
+            "use_default_excludes": False,
+        },
+    )
+    assert unfiltered.status_code == 200
+    assert sorted(unfiltered.json()["files"]) == sorted(
+        [
+            ".git/file.txt",
+            "bin/file.txt",
+            "instructions.md",
+            "nested/bin/file.txt",
+            "node_modules/file.txt",
+            "obj/file.txt",
+            "tmp.cache/file.txt",
+        ]
+    )
+    assert unfiltered.json()["truncated"] is False
+
+    # Exact limit does not mark truncated; limit - 1 does.
+    total = len(unfiltered.json()["files"])
+    exact = client.get(
+        "/api/file/list",
+        params={
+            "path": str(tmp_path),
+            "limit": total,
+            "use_default_excludes": False,
+        },
+    )
+    assert exact.status_code == 200
+    assert exact.json()["truncated"] is False
+    assert len(exact.json()["files"]) == total
+
+    capped = client.get(
+        "/api/file/list",
+        params={
+            "path": str(tmp_path),
+            "limit": total - 1,
+            "use_default_excludes": False,
+        },
+    )
+    assert capped.status_code == 200
+    assert capped.json()["truncated"] is True
+    assert len(capped.json()["files"]) == total - 1
+
+    # Default excludes can be combined with additional exclude patterns.
+    combined = client.get(
+        "/api/file/list",
+        params={"path": str(tmp_path), "exclude": ["obj", "tmp.cache"]},
+    )
+    assert combined.status_code == 200
+    assert sorted(combined.json()["files"]) == [
+        "bin/file.txt",
+        "instructions.md",
+        "nested/bin/file.txt",
+    ]

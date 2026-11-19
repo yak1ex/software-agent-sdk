@@ -11,6 +11,7 @@ import tarfile
 import tempfile
 import time
 import zipfile
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from typing import IO, Annotated, Any, Literal
@@ -82,7 +83,38 @@ class WorkspaceFileList(BaseModel):
     truncated: bool = False
 
 
-def _list_workspace_files(path: str, limit: int) -> WorkspaceFileList:
+def _directory_is_excluded(rel_posix: str, name: str, patterns: Sequence[str]) -> bool:
+    """Return True if a directory matches any file-discovery exclude pattern.
+
+    Bare patterns (no '/') match a directory name at any depth (like ``find
+    -name``). Patterns containing '/' match workspace-relative paths (like
+    ``find -path './<pattern>'``), so ``*/bin`` excludes nested ``bin``
+    directories while keeping a root ``bin`` directory.
+    """
+    case_insensitive = os.name == "nt"
+    target_name = name.lower() if case_insensitive else name
+    target_path = f"./{rel_posix.lower() if case_insensitive else rel_posix}"
+    for raw in patterns:
+        pattern = raw.replace("\\", "/").lower() if case_insensitive else raw
+        pattern = pattern.rstrip("/")
+        if not pattern:
+            continue
+        if "/" not in pattern:
+            if fnmatch.fnmatchcase(target_name, pattern):
+                return True
+        else:
+            relative = pattern if pattern.startswith("./") else f"./{pattern}"
+            if fnmatch.fnmatchcase(target_path, relative):
+                return True
+    return False
+
+
+def _list_workspace_files(
+    path: str,
+    limit: int,
+    excluded_patterns: Sequence[str] = tuple(WORKSPACE_EXCLUDED_DIRS),
+    include_symlinks: bool = False,
+) -> WorkspaceFileList:
     root = Path(path).resolve()
     if not root.is_dir():
         raise HTTPException(status_code=400, detail="Path must be a directory")
@@ -94,41 +126,97 @@ def _list_workspace_files(path: str, limit: int) -> WorkspaceFileList:
             status_code=400, detail="Unable to read workspace"
         ) from error
 
+    def is_dir_link(entry: Path) -> bool:
+        try:
+            return entry.is_symlink() or entry.is_junction()
+        except OSError:
+            return True
+
+    def is_allowed_file(entry: Path) -> bool:
+        try:
+            if not include_symlinks and entry.is_symlink():
+                return False
+            return entry.is_file()
+        except OSError:
+            return False
+
     for directory, dirs, names in os.walk(root, followlinks=False, onerror=on_error):
         current = Path(directory)
         visited += 1
         if visited > 20000:
             return WorkspaceFileList(files=files, truncated=True)
-        dirs[:] = sorted(
-            name
-            for name in dirs
-            if name not in WORKSPACE_EXCLUDED_DIRS
-            and not (current / name).is_symlink()
-            and not (current / name).is_junction()
-        )
-        for name in sorted(names):
-            file = current / name
-            if name == ".git" or file.is_symlink() or not file.is_file():
+        rel_dir = current.relative_to(root).as_posix()
+        kept_dirs: list[str] = []
+        for name in sorted(dirs):
+            rel_child = name if rel_dir == "." else f"{rel_dir}/{name}"
+            if _directory_is_excluded(rel_child, name, excluded_patterns):
                 continue
-            if len(files) == limit:
+            if is_dir_link(current / name):
+                continue
+            kept_dirs.append(name)
+        dirs[:] = kept_dirs
+        for name in sorted(names):
+            rel_file = name if rel_dir == "." else f"{rel_dir}/{name}"
+            if name == ".git" and _directory_is_excluded(
+                rel_file, name, excluded_patterns
+            ):
+                continue
+            if not is_allowed_file(current / name):
+                continue
+            if limit > 0 and len(files) == limit:
                 return WorkspaceFileList(files=files, truncated=True)
-            files.append(file.relative_to(root).as_posix())
+            files.append(rel_file)
     return WorkspaceFileList(files=files)
 
 
 @file_router.get("/list")
 async def list_workspace_files(
-    path: str = Query(..., description="Workspace directory"),
-    limit: int = Query(2000, ge=1, le=20000),
+    path: Annotated[str, Query(description="Workspace directory")],
+    limit: Annotated[
+        int, Query(ge=0, description="Maximum files to return (0 for unlimited)")
+    ] = 2000,
+    use_default_excludes: Annotated[
+        bool,
+        Query(
+            description=(
+                "Whether to apply the built-in default excluded directories. "
+                "Set false to supply the full exclusion list via `exclude`."
+            )
+        ),
+    ] = True,
+    exclude: Annotated[
+        list[str] | None,
+        Query(
+            description=(
+                "Directory patterns to exclude (repeatable). Bare names match at "
+                "any depth; patterns containing '/' match workspace-relative paths."
+            )
+        ),
+    ] = None,
+    include_symlinks: Annotated[
+        bool, Query(description="Include symbolic links to regular files.")
+    ] = False,
 ) -> WorkspaceFileList:
     """List workspace-relative files without invoking a shell.
 
-    Traversal excludes build/vendor directories and symbolic links. Results are
-    bounded by the file limit and 20,000 visited directories; truncated signals
-    either bound. Filenames and whitespace are preserved verbatim.
+    Traversal excludes configured directories and directory symbolic links.
+    Results are bounded by the file limit (0 for unlimited) and 20,000 visited
+    directories; truncated signals either bound. Filenames and whitespace are
+    preserved verbatim.
     """
     update_last_execution_time()
-    return await asyncio.to_thread(_list_workspace_files, path, limit)
+    excluded_patterns: list[str] = []
+    if use_default_excludes:
+        excluded_patterns.extend(WORKSPACE_EXCLUDED_DIRS)
+    if exclude:
+        excluded_patterns.extend(exclude)
+    return await asyncio.to_thread(
+        _list_workspace_files,
+        path,
+        limit,
+        excluded_patterns,
+        include_symlinks,
+    )
 
 
 _FILE_DOWNLOAD_RESPONSES: dict[int | str, dict[str, Any]] = {
